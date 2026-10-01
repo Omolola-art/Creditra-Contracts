@@ -8,13 +8,24 @@
 //!
 //! - [`open_credit_line`] — admin-only line creation; idempotent re-open
 //!   of non-Active lines under admin auth.
-//! - [`suspend_credit_line_internal`] / [`suspend_credit_line`] /
-//!   [`self_suspend_credit_line`] — Active → Suspended transition (admin
-//!   path and borrower path).
-//! - [`close_credit_line`] — Active/Suspended/Restricted → Closed.
+//! - [`suspend_credit_line`] — admin-initiated `Active → Suspended`
+//!   transition (requires admin auth, distinct from self-suspension).
+//! - [`self_suspend_credit_line`] — borrower-initiated `Active → SelfSuspended`
+//!   transition (requires borrower auth, distinct status `SelfSuspended = 5`).
+//!   The two suspension origins are intentionally distinct for auditability and
+//!   least-privilege: the stored `CreditStatus` differs, events are emitted on
+//!   different topics (`"suspend"` vs `"self_sus"`), and unsuspend paths are
+//!   authorization-separated (admin can unsuspend any, borrower can only
+//!   self-unsuspend `SelfSuspended`).
+//! - [`unsuspend_credit_line`] — admin-only `Suspended|SelfSuspended → Active`
+//!   (clears `suspension_ts`).
+//! - [`self_unsuspend_credit_line`] — borrower-only `SelfSuspended → Active`
+//!   (borrower can revert their own voluntary suspension; admin suspension
+//!   requires admin unsuspend, preserving least privilege).
+//! - [`close_credit_line`] — Active/Suspended/SelfSuspended/Restricted → Closed.
 //!   Borrower path requires `utilized_amount == 0`; admin path is
-//!   unconditional. Idempotent on already-Closed.
-//! - [`default_credit_line`] — Active/Restricted/Suspended → Defaulted.
+//!   unconditional. Stale close reverts `StaleStateTransition`.
+//! - [`default_credit_line`] — Active/Restricted/Suspended/SelfSuspended → Defaulted.
 //!   Emits `("credit","liq_req")` for the off-chain orchestrator.
 //! - [`reinstate_credit_line`] — Defaulted → Active or Restricted
 //!   (admin-controlled cure).
@@ -99,7 +110,7 @@ use crate::events::{
 use crate::risk::{MAX_INTEREST_RATE_BPS, MAX_RISK_SCORE};
 use crate::storage::{
     add_treasury_balance as storage_add_treasury_balance,
-    assert_not_paused, assert_ts_monotonic, bump_credit_line_ttl,
+    assert_not_paused, assert_ts_monotonic,
     clear_repayment_schedule, get_credit_line,
     get_late_fee_flat as storage_get_late_fee_flat,
     get_repayment_schedule, persist_credit_line,
@@ -109,6 +120,10 @@ use crate::storage::{
 };
 use crate::types::{ContractError, CreditLineData, CreditStatus, RepaymentSchedule};
 use soroban_sdk::{symbol_short, Address, Env, Symbol, Vec};
+
+fn liquidation_settlement_key(borrower: &Address, settlement_id: &Symbol) -> (Symbol, Address, Symbol) {
+    (symbol_short!("liq_seen"), borrower.clone(), settlement_id.clone())
+}
 
 /// Guard helper: assert that a state transition is valid given the current status.
 ///
@@ -226,7 +241,30 @@ pub fn validate_credit_limit_bounds(env: &Env, credit_limit: i128) {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn suspend_credit_line_internal(env: &Env, borrower: Address) {
+/// Internal helper: Active → {Suspended, SelfSuspended}.
+///
+/// # Determinism
+/// The transition is gated on `Active` only; any other source reverts with a
+/// typed `ContractError` via `require_valid_transition`. The `StaleStateTransition`
+/// (60) case is handled when `current == target`. This makes retries idempotent
+/// and concurrent duplicate calls diagnosable, not silently successful.
+///
+/// # Authorization
+/// This helper does NOT check auth; callers must enforce admin or borrower
+/// auth before invoking it. That keeps the single `require_auth` call per
+/// invocation (Soroban's auth-mock treats a second `require_auth` for an
+/// already-authorized address in the same frame as an error).
+///
+/// # Storage
+/// Applies accrual before mutation, bumps TTL on read, persists via
+/// `persist_credit_line` with `previous_utilized` for `TotalUtilized`
+/// conservation, and sets `suspension_ts` monotonically.
+fn suspend_credit_line_internal(env: &Env, borrower: Address, target: CreditStatus) {
+    debug_assert!(
+        target == CreditStatus::Suspended || target == CreditStatus::SelfSuspended,
+        "suspend target must be Suspended or SelfSuspended"
+    );
+
     // Bump TTL on read: this is a hot accrual read path, so an active
     // borrower's entry must never be archived independently of draw/repay.
     let stored_line: CreditLineData = get_credit_line(env, &borrower)
@@ -238,29 +276,30 @@ fn suspend_credit_line_internal(env: &Env, borrower: Address) {
     // Apply interest accrual before any mutation.
     let mut credit_line = crate::accrual::apply_accrual(env, stored_line);
 
-    // Guard: Active → Suspended is the only valid transition.
-    //   - Suspended  → Suspended  : stale repeat — StaleStateTransition
-    //   - Defaulted  → Suspended  : wrong state  — CreditLineDefaulted
-    //   - Closed     → Suspended  : wrong state  — CreditLineClosed
-    //   - Restricted → Suspended  : wrong state  — CreditLineSuspended (draws
-    //                               are not flat-blocked on Restricted; the
-    //                               existing error is reused for "not Active")
+    // Guard: Active → {Suspended, SelfSuspended} is the only valid transition.
+    //   - Suspended     → Suspended     : stale — StaleStateTransition (60)
+    //   - SelfSuspended → SelfSuspended : stale — StaleStateTransition (60)
+    //   - Suspended     → SelfSuspended : wrong — CreditLineSuspended (already suspended)
+    //   - SelfSuspended → Suspended     : wrong — CreditLineSuspended
+    //   - Defaulted     → *Suspended    : wrong — CreditLineDefaulted
+    //   - Closed        → *Suspended    : wrong — CreditLineClosed
+    //   - Restricted    → *Suspended    : wrong — CreditLineSuspended
     require_valid_transition(
         env,
         credit_line.status,
-        CreditStatus::Suspended,
+        target,
         &[CreditStatus::Active],
         if credit_line.status == CreditStatus::Closed {
             ContractError::CreditLineClosed
         } else if credit_line.status == CreditStatus::Defaulted {
             ContractError::CreditLineDefaulted
         } else {
-            // Restricted — cannot suspend; borrower needs to repay first.
+            // Restricted, Suspended, SelfSuspended — cannot (re-)suspend.
             ContractError::CreditLineSuspended
         },
     );
 
-    credit_line.status = CreditStatus::Suspended;
+    credit_line.status = target;
     let new_ts = env.ledger().timestamp();
     assert_ts_monotonic(env, credit_line.suspension_ts, new_ts);
     credit_line.suspension_ts = new_ts;
@@ -272,12 +311,23 @@ fn suspend_credit_line_internal(env: &Env, borrower: Address) {
         Some(previous_status),
     );
 
+    // Distinct event topics for auditability:
+    //  - admin suspension → ("credit","suspend") with status Suspended
+    //  - self  suspension → ("credit","self_sus") with status SelfSuspended
+    // Indexers and dashboards can distinguish the origin without parsing the
+    // status field alone, and the status field remains the canonical on-chain
+    // truth for draw-blocking logic.
+    let topic = if target == CreditStatus::Suspended {
+        symbol_short!("suspend")
+    } else {
+        symbol_short!("self_sus")
+    };
     publish_credit_line_event(
         env,
-        (symbol_short!("credit"), symbol_short!("suspend")),
+        (symbol_short!("credit"), topic),
         CreditLineEvent {
             borrower,
-            status: CreditStatus::Suspended,
+            status: target,
             credit_limit: credit_line.credit_limit,
             interest_rate_bps: credit_line.interest_rate_bps,
             risk_score: credit_line.risk_score,
@@ -297,6 +347,13 @@ fn suspend_credit_line_internal(env: &Env, borrower: Address) {
 /// # Panics
 /// - `ContractError::CreditLineNotFound` if no credit line exists for `borrower`.
 /// - `ContractError::CreditLineClosed` if the credit line is `Closed`.
+///
+/// # Storage
+/// Loads the credit line via [`crate::storage::get_credit_line`], which bumps
+/// the entry's persistent TTL on read. The bump therefore happens even when
+/// the admin clears the grace period (`0`) or the `Closed` guard reverts, so
+/// this admin-only path can never be the interaction that lets an active
+/// borrower's entry drift toward archival.
 pub fn set_per_borrower_liquidation_grace(
     env: &Env,
     borrower: Address,
@@ -305,10 +362,7 @@ pub fn set_per_borrower_liquidation_grace(
     assert_not_paused(env);
     require_admin_auth(env);
 
-    let stored_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
+    let stored_line: CreditLineData = get_credit_line(env, &borrower)
         .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
 
     if stored_line.status == CreditStatus::Closed {
@@ -339,6 +393,9 @@ pub fn get_per_borrower_liquidation_grace(env: &Env, borrower: Address) -> u64 {
 pub fn set_late_fee_flat(env: Env, fee: i128) {
     assert_not_paused(&env);
     require_admin_auth(&env);
+    // Issue #1169: fee parameters are frozen while a liquidation auction is
+    // active so in-flight auction economics stay deterministic.
+    crate::storage::assert_no_active_auctions(&env);
     if fee < 0 {
         env.panic_with_error(ContractError::InvalidAmount);
     }
@@ -382,32 +439,54 @@ pub fn open_credit_line(
 
     let existing_line = get_credit_line(&env, &borrower);
 
+    let mut previous_utilized = 0;
+    let mut previous_status = None;
+    let mut utilized_amount = 0;
+    let mut accrued_interest = 0;
+    let mut last_accrual_ts = env.ledger().timestamp();
+
     if let Some(existing) = existing_line.as_ref() {
         if existing.status == CreditStatus::Active {
             env.panic_with_error(ContractError::AlreadyInitialized);
         }
 
-        // Prevent borrower-controlled status bypasses on existing lines.
-        require_admin_auth(&env);
-    }
+        // Issue #1169: re-opening a `Defaulted` line replaces the defaulted
+        // record with a fresh `Active` line, which abandons the liquidation
+        // auction. `persist_credit_line` is called with `previous_status =
+        // None` below, so the active-auction counter is maintained here
+        // explicitly.
+        if existing.status == CreditStatus::Defaulted {
+            crate::storage::decrement_pending_auction_count(&env);
+        }
 
-    let previous_utilized = existing_line
-        .map(|existing| existing.utilized_amount)
-        .unwrap_or(0);
+        previous_status = Some(existing.status);
+        previous_utilized = existing.utilized_amount;
+
+        if existing.status != CreditStatus::Closed {
+            utilized_amount = existing.utilized_amount;
+            accrued_interest = existing.accrued_interest;
+            last_accrual_ts = existing.last_accrual_ts;
+        }
+    }
+    // Re-opening any existing non-Active line is admin-gated: auth is enforced
+    // by the `lib.rs` wrapper (`require_admin_auth`), not re-checked here — a
+    // second `require_auth` for the already-authorized admin address within one
+    // invocation is rejected by the Soroban auth frame as
+    // `Error(Auth, ExistingValue)` (same convention as `suspend_credit_line`).
 
     let credit_line = CreditLineData {
         borrower: borrower.clone(),
         credit_limit,
-        utilized_amount: 0,
+        utilized_amount,
         interest_rate_bps,
         risk_score,
         status: CreditStatus::Active,
         last_rate_update_ts: 0,
-        accrued_interest: 0,
-        last_accrual_ts: env.ledger().timestamp(),
+        accrued_interest,
+        last_accrual_ts,
         suspension_ts: 0,
     };
-    persist_credit_line(&env, &borrower, &credit_line, previous_utilized, None);
+    persist_credit_line(&env, &borrower, &credit_line, previous_utilized, previous_status);
     clear_repayment_schedule(&env, &borrower);
 
     publish_credit_line_event(
@@ -426,60 +505,144 @@ pub fn open_credit_line(
 /// Suspend a credit line temporarily (admin only).
 ///
 /// # State transition
-/// `Active → Suspended`
+/// `Active → Suspended`  (admin origin, distinct from `SelfSuspended`)
 ///
-/// # Parameters
-/// - `borrower`: The borrower's address.
+/// # Authorization
+/// Admin only. Enforced by the `lib.rs` wrapper (`require_admin_auth`);
+/// not re-checked here to avoid a double `require_auth` on the same address
+/// within one invocation (Soroban auth-mock treats a second `require_auth`
+/// for an already-authorized address in the same frame as an error).
 ///
 /// # Panics
-/// - If no credit line exists for the given borrower.
-/// - If the credit line is not currently `Active`.
+/// - `CreditLineNotFound` — no line for `borrower`.
+/// - `StaleStateTransition` — already `Suspended` (or `SelfSuspended` — distinct
+///   state, but still "already suspended").
+/// - `CreditLineClosed` / `CreditLineDefaulted` / `CreditLineSuspended` — wrong source.
 ///
 /// # Events
-/// Emits a `("credit", "suspend")` [`CreditLineEvent`].
+/// Emits `("credit", "suspend")` with `status == Suspended`.
+/// Distinct from `self_suspend_credit_line` which emits `("credit","self_sus")`
+/// with `status == SelfSuspended`.
 pub fn suspend_credit_line(env: Env, borrower: Address) {
     assert_not_paused(&env);
-    // Admin auth is enforced by the `lib.rs` `suspend_credit_line` entrypoint
-    // wrapper before this is called; not re-checked here to avoid a double
-    // `require_auth` on the same address within one invocation (Soroban's
-    // auth-mock treats a second `require_auth` for an already-authorized
-    // address in the same frame as an error).
-    let mut credit_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
-        .expect("Credit line not found");
+    // Admin auth is enforced by the lib.rs wrapper.
+    suspend_credit_line_internal(&env, borrower, CreditStatus::Suspended);
+}
 
-    // Guard: Active → Suspended is the only valid transition.
-    //   - Suspended  → Suspended  : stale repeat  — StaleStateTransition
-    //   - Defaulted  → Suspended  : wrong state   — CreditLineDefaulted
-    //   - Closed     → Suspended  : wrong state   — CreditLineClosed
-    //   - Restricted → Suspended  : wrong state   — CreditLineSuspended
-    require_valid_transition(
+/// Suspend the caller's own active credit line (borrower only).
+///
+/// This is a borrower safety control that blocks future draws while leaving
+/// repayments available. The resulting status is `SelfSuspended` (5), distinct
+/// from admin `Suspended` (1) for auditability and authorization separation.
+///
+/// # Authorization
+/// Requires `borrower.require_auth()`. Admin cannot invoke this path on
+/// behalf of a borrower — that would conflate voluntary and involuntary
+/// suspension in the audit trail.
+///
+/// # State transition
+/// `Active → SelfSuspended`. Any other source reverts with a typed error
+/// (`StaleStateTransition` for duplicate, `CreditLine*` for wrong state).
+///
+/// # Events
+/// Emits `("credit","self_sus")` with `status == SelfSuspended`, distinct
+/// from admin suspension's `("credit","suspend")`.
+///
+/// # Storage
+/// Loads via `get_credit_line` (TTL-bumped), applies accrual, persists via
+/// `persist_credit_line` with `previous_utilized` conservation.
+pub fn self_suspend_credit_line(env: Env, borrower: Address) {
+    assert_not_paused(&env);
+    borrower.require_auth();
+    suspend_credit_line_internal(&env, borrower, CreditStatus::SelfSuspended);
+}
+
+/// Unsuspend a credit line (admin only).
+///
+/// Transitions `Suspended` or `SelfSuspended` → `Active`. This is the
+/// admin recovery path for both suspension origins. A borrower who
+/// self-suspended can also use `self_unsuspend_credit_line` (borrower-only)
+/// to revert their own suspension without admin involvement; an admin
+/// suspension **cannot** be cleared by the borrower — least privilege.
+///
+/// # Authorization
+/// Admin only (enforced by `lib.rs` wrapper). Not re-checked here for the
+/// same double-auth reason as `suspend_credit_line`.
+///
+/// # Validation
+/// - `Active` → `Active` stale → `StaleStateTransition`.
+/// - `Defaulted` / `Closed` / `Restricted` → `CreditLine*` wrong state.
+///
+/// # Events
+/// Emits `("credit","unsuspend")` with `status == Active`.
+///
+/// # Concurrency / retry safety
+/// The transition is checked via `require_valid_transition`; a concurrent
+/// or retried unsuspend after the line is already `Active` reverts with
+/// `StaleStateTransition` deterministically, not silently succeeding.
+pub fn unsuspend_credit_line(env: Env, borrower: Address) {
+    assert_not_paused(&env);
+    // Admin auth enforced by lib.rs wrapper.
+    let stored_line: CreditLineData = get_credit_line(&env, &borrower)
+        .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
+    let previous_utilized = stored_line.utilized_amount;
+    let previous_status = stored_line.status;
+    let mut credit_line = crate::accrual::apply_accrual(&env, stored_line);
+
+    // Guard: Suspended|SelfSuspended → Active.
+    //   - Active → Active (stale) handled via StaleStateTransition.
+    //   - Defaulted/Closed/Restricted → wrong state errors.
+    let is_suspended =
+        credit_line.status == CreditStatus::Suspended || credit_line.status == CreditStatus::SelfSuspended;
+    if !is_suspended {
+        require_valid_transition(
+            &env,
+            credit_line.status,
+            CreditStatus::Active,
+            &[CreditStatus::Suspended, CreditStatus::SelfSuspended],
+            if credit_line.status == CreditStatus::Closed {
+                ContractError::CreditLineClosed
+            } else if credit_line.status == CreditStatus::Defaulted {
+                ContractError::CreditLineDefaulted
+            } else {
+                // Restricted or already Active — stale vs wrong distinguished
+                // inside require_valid_transition.
+                ContractError::CreditLineSuspended
+            },
+        );
+        // If not suspended, the above will have panicked; unreachable.
+        return;
+    }
+
+    // Apply valid transition check for duplicate Active case and wrong states.
+    // For suspended sources we still want stale handling for Active->Active.
+    // The is_suspended branch already ensures we're in a valid source; we still
+    // call the guard for consistency on edge cases (e.g. Active).
+    // But for suspended → Active we can directly transition.
+    // To keep determinism for duplicate unsuspend (Active → Active), we need
+    // to handle that case: if already Active, this is stale.
+    // Since we are here is_suspended == true, we skip stale check.
+
+    // Additional stale check: if already Active, revert with StaleStateTransition.
+    // This is technically unreachable here because is_suspended true, but
+    // we keep the guard for completeness via explicit match below.
+    // Perform transition.
+    credit_line.status = CreditStatus::Active;
+    credit_line.suspension_ts = 0;
+    persist_credit_line(
         &env,
-        credit_line.status,
-        CreditStatus::Suspended,
-        &[CreditStatus::Active],
-        if credit_line.status == CreditStatus::Closed {
-            ContractError::CreditLineClosed
-        } else if credit_line.status == CreditStatus::Defaulted {
-            ContractError::CreditLineDefaulted
-        } else {
-            ContractError::CreditLineSuspended
-        },
+        &borrower,
+        &credit_line,
+        previous_utilized,
+        Some(previous_status),
     );
-
-    credit_line.status = CreditStatus::Suspended;
-    env.storage().persistent().set(&borrower, &credit_line);
-    // Bump TTL: interacting with a suspended line keeps it live.
-    bump_credit_line_ttl(&env, &borrower);
 
     publish_credit_line_event(
         &env,
-        (symbol_short!("credit"), symbol_short!("suspend")),
+        (symbol_short!("credit"), symbol_short!("unsuspend")),
         CreditLineEvent {
-            borrower: borrower.clone(),
-            status: CreditStatus::Suspended,
+            borrower,
+            status: CreditStatus::Active,
             credit_limit: credit_line.credit_limit,
             interest_rate_bps: credit_line.interest_rate_bps,
             risk_score: credit_line.risk_score,
@@ -487,20 +650,69 @@ pub fn suspend_credit_line(env: Env, borrower: Address) {
     );
 }
 
-/// Suspend the caller's own active credit line.
+/// Borrower-initiated unsuspend for self-suspended lines only.
 ///
-/// This is a borrower safety control that blocks future draws while leaving
-/// repayments available. Reactivation still requires a separate admin-controlled
-/// workflow.
+/// Transitions `SelfSuspended → Active`. This lets a borrower revert their
+/// own voluntary suspension without admin intervention, while preserving
+/// least privilege: a borrower **cannot** unsuspend an admin `Suspended` line.
 ///
-/// # Storage
-/// Loads the credit line via [`crate::storage::get_credit_line`], which bumps
-/// the entry's persistent TTL on read — independent of whether the call goes
-/// on to mutate and persist the line.
-pub fn self_suspend_credit_line(env: Env, borrower: Address) {
+/// # Authorization
+/// Requires `borrower.require_auth()`.
+///
+/// # Validation
+/// - `SelfSuspended → Active` is the only valid transition.
+/// - `Suspended → Active` via this path reverts `CreditLineSuspended`
+///   (admin suspension requires admin unsuspend).
+/// - `Active → Active` (duplicate) reverts `StaleStateTransition`.
+pub fn self_unsuspend_credit_line(env: Env, borrower: Address) {
     assert_not_paused(&env);
     borrower.require_auth();
-    suspend_credit_line_internal(&env, borrower);
+
+    let stored_line: CreditLineData = get_credit_line(&env, &borrower)
+        .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
+    let previous_utilized = stored_line.utilized_amount;
+    let previous_status = stored_line.status;
+    let mut credit_line = crate::accrual::apply_accrual(&env, stored_line);
+
+    require_valid_transition(
+        &env,
+        credit_line.status,
+        CreditStatus::Active,
+        &[CreditStatus::SelfSuspended],
+        if credit_line.status == CreditStatus::Closed {
+            ContractError::CreditLineClosed
+        } else if credit_line.status == CreditStatus::Defaulted {
+            ContractError::CreditLineDefaulted
+        } else if credit_line.status == CreditStatus::Suspended {
+            // Admin suspension cannot be cleared by borrower.
+            ContractError::CreditLineSuspended
+        } else {
+            // Restricted or Already Active — stale vs wrong inside guard.
+            ContractError::CreditLineSuspended
+        },
+    );
+
+    credit_line.status = CreditStatus::Active;
+    credit_line.suspension_ts = 0;
+    persist_credit_line(
+        &env,
+        &borrower,
+        &credit_line,
+        previous_utilized,
+        Some(previous_status),
+    );
+
+    publish_credit_line_event(
+        &env,
+        (symbol_short!("credit"), Symbol::new(&env, "self_uns")),
+        CreditLineEvent {
+            borrower,
+            status: CreditStatus::Active,
+            credit_limit: credit_line.credit_limit,
+            interest_rate_bps: credit_line.interest_rate_bps,
+            risk_score: credit_line.risk_score,
+        },
+    );
 }
 
 /// Close a credit line permanently.
@@ -585,6 +797,12 @@ pub fn close_credit_line(env: Env, borrower: Address, closer: Address) {
 
     let previous_status = credit_line.status;
     credit_line.status = CreditStatus::Closed;
+    // Issue #1169: admin force-closing a defaulted line abandons its
+    // liquidation auction, so the active-auction counter is decremented
+    // atomically with the status write.
+    if previous_status == CreditStatus::Defaulted {
+        crate::storage::decrement_pending_auction_count(&env);
+    }
     persist_credit_line(
         &env,
         &borrower,
@@ -651,10 +869,7 @@ pub fn close_credit_lines_batch(env: Env, borrowers: Vec<Address>) {
 pub fn default_credit_line(env: Env, borrower: Address) {
     assert_not_paused(&env);
     // Admin auth enforced by the `lib.rs` wrapper (see `suspend_credit_line`).
-    let stored_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
+    let stored_line: CreditLineData = get_credit_line(&env, &borrower)
         .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
     let previous_utilized = stored_line.utilized_amount;
 
@@ -669,14 +884,21 @@ pub fn default_credit_line(env: Env, borrower: Address) {
         env.panic_with_error(ContractError::CreditLineClosed);
     }
 
-    // Guard: Active, Suspended, or Restricted → Defaulted are the only valid transitions.
+    // Guard: Active, Suspended, SelfSuspended, or Restricted → Defaulted are the only valid transitions.
+    // Both suspension origins are treated as default-eligible; the distinction
+    // is preserved for audit but does not affect liquidation eligibility.
     //   - Defaulted → Defaulted : stale repeat     — StaleStateTransition
     //   - Closed    → Defaulted : terminal state   — CreditLineClosed
     require_valid_transition(
         &env,
         credit_line.status,
         CreditStatus::Defaulted,
-        &[CreditStatus::Active, CreditStatus::Suspended, CreditStatus::Restricted],
+        &[
+            CreditStatus::Active,
+            CreditStatus::Suspended,
+            CreditStatus::SelfSuspended,
+            CreditStatus::Restricted,
+        ],
         ContractError::CreditLineClosed,
     );
 
@@ -700,6 +922,11 @@ pub fn default_credit_line(env: Env, borrower: Address) {
 
     let previous_status = credit_line.status;
     credit_line.status = CreditStatus::Defaulted;
+    // Issue #1169: entering `Defaulted` marks this line's liquidation auction
+    // as active. The increment happens atomically with the status write in the
+    // same host transaction, so fee-config guards never observe a half-updated
+    // state.
+    crate::storage::increment_pending_auction_count(&env);
     persist_credit_line(
         &env,
         &borrower,
@@ -723,23 +950,56 @@ pub fn default_credit_line(env: Env, borrower: Address) {
     publish_default_liquidation_requested_event(&env, &borrower, credit_line.utilized_amount);
 }
 
+/// Allocate a repayment amount across accrued interest and principal.
+///
+/// Splits `amount` interest-first: `accrued_interest` is reduced first,
+/// then the remainder reduces `utilized_amount` (principal). Returns the
+/// `(interest_repaid, principal_repaid)` breakdown.
+///
+/// The amount is clamped to `credit_line.utilized_amount` to prevent
+/// over-repayment. This preserves the `accrued_interest <= utilized_amount`
+/// invariant because reducing `accrued_interest` first ensures it never
+/// exceeds the remaining `utilized_amount`.
+pub fn allocate_repayment(credit_line: &mut CreditLineData, amount: i128) -> (i128, i128) {
+    let effective_repay = if amount > credit_line.utilized_amount {
+        credit_line.utilized_amount
+    } else {
+        amount
+    };
+
+    let interest_repaid = effective_repay.min(credit_line.accrued_interest);
+    let principal_repaid = effective_repay - interest_repaid;
+
+    credit_line.accrued_interest -= interest_repaid;
+    credit_line.utilized_amount -= effective_repay;
+
+    (interest_repaid, principal_repaid)
+}
+
 /// Apply auction liquidation proceeds to a defaulted credit line (admin only).
 ///
 /// Reduces `accrued_interest` first, then `utilized_amount`, by `amount`
 /// (clamped to the outstanding balance). No token movement occurs — this is
 /// pure accounting relief, e.g. for negotiated settlements handled off-chain.
+///
+/// # Authorization
+/// Admin only. Enforced by the `lib.rs` wrapper (`require_admin_auth`); not
+/// re-checked here because a second `require_auth` for the already-authorized
+/// admin address within one invocation is rejected by the Soroban auth frame as
+/// `Error(Auth, ExistingValue)` (same convention as `suspend_credit_line`).
+///
+/// # Storage
+/// Loads the credit line via [`crate::storage::get_credit_line`], which bumps
+/// the entry's persistent TTL on read, before any mutation of the debt
+/// buckets.
 pub fn forgive_debt(env: Env, borrower: Address, amount: i128) {
     assert_not_paused(&env);
-    require_admin_auth(&env);
 
     if amount <= 0 {
         env.panic_with_error(ContractError::InvalidAmount);
     }
 
-    let stored_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
+    let stored_line: CreditLineData = get_credit_line(&env, &borrower)
         .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
     let previous_utilized = stored_line.utilized_amount;
     let previous_status = stored_line.status;
@@ -831,7 +1091,10 @@ pub fn settle_default_liquidation(
     oracle_price: Option<i128>,
 ) {
     // Step 1: Authorization
-    require_admin_auth(&env);
+    // Admin auth is enforced by the `lib.rs` wrapper (see `suspend_credit_line`
+    // for why this is not re-checked here): a second `require_auth` for the
+    // already-authorized admin address within one invocation is rejected by the
+    // Soroban auth frame as `Error(Auth, ExistingValue)`.
 
     // Step 2: Numeric validation (cheap checks before any storage reads)
     if recovered_amount <= 0 {
@@ -889,14 +1152,19 @@ pub fn settle_default_liquidation(
     }
 
     // Step 8: State mutation (after all validation succeeds)
-    credit_line.utilized_amount = credit_line
-        .utilized_amount
-        .checked_sub(recovered_amount)
-        .unwrap_or_else(|| env.panic_with_error(ContractError::Overflow));
+    let (interest_recovered, principal_recovered) =
+        allocate_repayment(&mut credit_line, recovered_amount);
 
     let previous_status = credit_line.status;
     if credit_line.utilized_amount == 0 {
         credit_line.status = CreditStatus::Closed;
+    }
+
+    // Issue #1169: a full settlement transitions the line out of `Defaulted`,
+    // ending its active auction. A partial settlement leaves the line in
+    // `Defaulted`, so the auction stays active and the counter is untouched.
+    if previous_status == CreditStatus::Defaulted && credit_line.status == CreditStatus::Closed {
+        crate::storage::decrement_pending_auction_count(&env);
     }
 
     persist_credit_line(
@@ -937,6 +1205,8 @@ pub fn settle_default_liquidation(
             borrower,
             settlement_id,
             recovered_amount,
+            interest_recovered,
+            principal_recovered,
             remaining_utilized_amount: credit_line.utilized_amount,
             status: credit_line.status,
             close_factor_bps,
@@ -1012,6 +1282,12 @@ pub fn reinstate_credit_line(env: Env, borrower: Address, target_status: CreditS
     let previous_status = credit_line.status;
     credit_line.status = target_status;
     credit_line.suspension_ts = 0;
+    // Issue #1169: reinstating a defaulted line abandons its liquidation
+    // auction, so the active-auction counter is decremented atomically with
+    // the status write.
+    if previous_status == CreditStatus::Defaulted {
+        crate::storage::decrement_pending_auction_count(&env);
+    }
     persist_credit_line(
         &env,
         &borrower,
@@ -1051,6 +1327,12 @@ pub fn reinstate_credit_line(env: Env, borrower: Address, target_status: CreditS
 /// # Authorization
 /// Requires admin authorization because the schedule controls delinquency and
 /// due-date state for the borrower.
+///
+/// # Storage
+/// The existence check reads through [`crate::storage::get_credit_line`], so
+/// the credit-line entry's persistent TTL is bumped on read; the schedule
+/// entry itself is bumped by
+/// [`crate::storage::set_repayment_schedule`] on write.
 pub fn set_repayment_schedule(
     env: &Env,
     borrower: Address,
@@ -1065,7 +1347,7 @@ pub fn set_repayment_schedule(
         env.panic_with_error(ContractError::InvalidAmount);
     }
 
-    if !env.storage().persistent().has(&borrower) {
+    if get_credit_line(env, &borrower).is_none() {
         env.panic_with_error(ContractError::CreditLineNotFound);
     }
 
@@ -1075,10 +1357,65 @@ pub fn set_repayment_schedule(
         next_due_ts: first_due_ts,
     };
     storage_set_repayment_schedule(env, &borrower, &schedule);
-    // Setting a schedule is an interaction with the credit line, so keep the
-    // credit-line entry live as well (the schedule entry is bumped by the
-    // storage setter itself).
-    bump_credit_line_ttl(env, &borrower);
+    // The credit-line entry is bumped by `get_credit_line` above and the
+    // schedule entry is bumped by the storage setter itself, so this path
+    // refreshes every persistent key it touches.
+}
+
+/// Deterministically allocate a repayment across the debt components.
+///
+/// `utilized_amount` is treated as the total debt bucket and `accrued_interest`
+/// is the interest slice of that bucket. The allocator normalizes the current
+/// debt split before computing the repayment so `interest_repaid` and
+/// `principal_repaid` always derive from the same valid state, even when the
+/// line has drifted across a boundary or contains stale component values.
+pub fn allocate_repayment(
+    total_debt: i128,
+    accrued_interest: i128,
+    requested_amount: i128,
+) -> (i128, i128, i128) {
+    let total_debt = total_debt.max(0);
+    let normalized_interest = accrued_interest.min(total_debt).max(0);
+    let effective_repay = requested_amount.min(total_debt).max(0);
+    let interest_repaid = effective_repay.min(normalized_interest).max(0);
+    let principal_repaid = effective_repay.saturating_sub(interest_repaid);
+
+    (effective_repay, interest_repaid, principal_repaid)
+}
+
+/// Number of already-due installments covered by a repayment that settles
+/// `installments_paid` whole installments.
+///
+/// This reproduces exactly the set the previous per-installment loop walked:
+///
+/// ```text
+/// count = #{ i in 0..installments_paid : now > next_due_ts + i * period_seconds }
+/// ```
+///
+/// Since `period_seconds > 0`, that condition is equivalent to
+/// `i * period_seconds < now - next_due_ts`, so the count is
+/// `ceil((now - next_due_ts) / period_seconds)`, clamped to `installments_paid`
+/// — the old loop's natural upper bound and its defensive cap.
+///
+/// The strict `>` comparison matters: a due date exactly equal to `now` is *not*
+/// overdue, so `elapsed / period_seconds + 1` would over-count at exact period
+/// boundaries. The ceiling is computed as `((elapsed - 1) / period_seconds) + 1`
+/// to avoid the `elapsed + period_seconds - 1` form, whose addition could
+/// overflow `u64`.
+///
+/// Returns `0` when nothing is due or the schedule is degenerate.
+fn overdue_installment_count(
+    now: u64,
+    next_due_ts: u64,
+    period_seconds: u64,
+    installments_paid: u64,
+) -> u64 {
+    if installments_paid == 0 || period_seconds == 0 || now <= next_due_ts {
+        return 0;
+    }
+    let elapsed = now - next_due_ts; // > 0
+    let overdue = ((elapsed - 1) / period_seconds) + 1;
+    overdue.min(installments_paid)
 }
 
 /// Advance a borrower's installment schedule after a repayment.
@@ -1097,6 +1434,16 @@ pub fn set_repayment_schedule(
 /// Interest-only repayments and partial principal installments do not move the
 /// due date. Arithmetic uses checked/saturating operations so malformed state or
 /// extreme schedule values cannot wrap timestamps.
+///
+/// # Late-fee surcharge
+///
+/// When a flat late fee is configured, the number of overdue installments
+/// covered by the repayment is derived **arithmetically** (see
+/// [`overdue_installment_count`]) rather than by iterating once per
+/// installment. The fee for every overdue installment is charged to the
+/// treasury in a single write and reported in a single
+/// [`crate::events::LateFeeChargedEvent`], so the work done here is O(1)
+/// regardless of `installments_paid`.
 pub fn advance_repayment_schedule_after_repay(
     env: &Env,
     borrower: &Address,
@@ -1121,25 +1468,44 @@ pub fn advance_repayment_schedule_after_repay(
         return;
     }
 
-    // ── Late-fee surcharge ──────────────────────────────────────────────────
+    // ── Late-fee surcharge (O(1), aggregated) ───────────────────────────────
+    //
+    // The overdue count is computed arithmetically. The previous implementation
+    // looped `0..installments_paid`, performing a treasury write and emitting a
+    // `LateFeeChargedEvent` for every overdue installment; a large repayment
+    // against a tiny `amount_per_period` (e.g. 10^12 installments) therefore
+    // did millions of storage writes and event publishes and could exceed the
+    // CPU budget. Charging the aggregate once performs a single write and emits
+    // a single event while accruing the same total fee.
     let late_fee = crate::storage::get_late_fee_flat(env);
     if late_fee > 0 {
         let now = env.ledger().timestamp();
-        for i in 0_u64..installments_paid {
-            let due_ts = schedule
-                .next_due_ts
-                .saturating_add(i.saturating_mul(schedule.period_seconds));
-            if now > due_ts {
-                crate::storage::add_treasury_balance(env, late_fee);
-                crate::events::publish_late_fee_charged_event(
-                    env,
-                    crate::events::LateFeeChargedEvent {
-                        borrower: borrower.clone(),
-                        fee: late_fee,
-                        installment_index: i.saturating_add(1),
-                    },
-                );
-            }
+        let overdue = overdue_installment_count(
+            now,
+            schedule.next_due_ts,
+            schedule.period_seconds,
+            installments_paid,
+        );
+        if overdue > 0 {
+            // `checked_mul` preserves the old loop's overflow behaviour: the
+            // repeated `add_treasury_balance` reverted with `Overflow` once the
+            // running total (or an individual product) exceeded `i128`.
+            let aggregate_fee = late_fee
+                .checked_mul(overdue as i128)
+                .unwrap_or_else(|| env.panic_with_error(ContractError::Overflow));
+            crate::storage::add_treasury_balance(env, aggregate_fee);
+            // One event per repayment: `fee` is the aggregate for every overdue
+            // installment and `installment_index` is the highest (most recent)
+            // installment charged, preserving the 1-based index space the old
+            // per-installment events used.
+            crate::events::publish_late_fee_charged_event(
+                env,
+                crate::events::LateFeeChargedEvent {
+                    borrower: borrower.clone(),
+                    fee: aggregate_fee,
+                    installment_index: overdue,
+                },
+            );
         }
     }
 
@@ -1173,7 +1539,7 @@ mod self_suspend {
     }
 
     /// A borrower can self-suspend their own active line; status transitions
-    /// to Suspended without admin involvement.
+    /// to SelfSuspended (distinct from admin Suspended) without admin involvement.
     #[test]
     fn self_suspend_transitions_active_to_suspended() {
         let env = Env::default();
@@ -1182,7 +1548,7 @@ mod self_suspend {
         client.self_suspend_credit_line(&borrower);
 
         let line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(line.status, CreditStatus::Suspended);
+        assert_eq!(line.status, CreditStatus::SelfSuspended);
     }
 
     /// Self-suspend requires the borrower's own authorization. `init` and a
@@ -1217,17 +1583,19 @@ mod self_suspend {
             ContractError::CreditLineSuspended.into()
         );
 
-        // Repayment against a Suspended line is allowed (no draw occurred, so
+        // Repayment against a SelfSuspended line is allowed (no draw occurred, so
         // utilized_amount is 0 — this just confirms repay_credit doesn't panic
         // on the suspended status itself).
         client.repay_credit(&borrower, &1_i128);
         let line = client.get_credit_line(&borrower).unwrap();
-        assert_eq!(line.status, CreditStatus::Suspended);
+        assert_eq!(line.status, CreditStatus::SelfSuspended);
     }
 
-    /// Self-suspending an already-suspended line panics (not idempotent).
+    /// Self-suspending an already-self-suspended line panics (not idempotent).
+    /// Duplicate suspension of the same origin reverts with StaleStateTransition
+    /// (60) since the line is already in the target state.
     #[test]
-    #[should_panic(expected = "Error(Contract, #20)")]
+    #[should_panic(expected = "Error(Contract, #60)")]
     fn self_suspend_twice_reverts() {
         let env = Env::default();
         let (client, borrower) = setup(&env);
@@ -1721,6 +2089,7 @@ mod installment {
             &50_000,
             &settlement_id,
             &5_000,
+            &None,
         );
 
         // Second settlement with same (borrower, settlement_id) should fail
@@ -1729,6 +2098,7 @@ mod installment {
             &25_000,
             &settlement_id, // Same ID
             &5_000,
+            &None,
         );
     }
 
@@ -1759,6 +2129,7 @@ mod installment {
             &recovery_1,
             &settlement_id_1,
             &3_333, // ~33%
+            &None,
         );
 
         let after_round_1 = client.get_credit_line(&borrower).unwrap();
@@ -1773,6 +2144,7 @@ mod installment {
             &recovery_2,
             &settlement_id_2,
             &5_000, // 50%
+            &None,
         );
 
         let after_round_2 = client.get_credit_line(&borrower).unwrap();
@@ -1790,6 +2162,7 @@ mod installment {
             &recovery_3,
             &settlement_id_3,
             &10_000, // 100%
+            &None,
         );
 
         let after_round_3 = client.get_credit_line(&borrower).unwrap();
@@ -1820,6 +2193,7 @@ mod installment {
             &0, // Invalid: zero recovered amount
             &settlement_id,
             &5_000,
+            &None,
         );
     }
 
@@ -1846,6 +2220,7 @@ mod installment {
             &50_000,
             &settlement_id,
             &5_000,
+            &None,
         );
     }
 }

@@ -66,7 +66,11 @@ use soroban_sdk::{contracttype, Address};
 /// - `Active` is the only state that permits new draws.
 /// - `Restricted` allows draws but the numeric limit check will fail until
 ///   the borrower repays under the reduced ceiling.
-/// - `Suspended` and `Defaulted` both block draws and allow repayments.
+/// - `Suspended` (admin) and `SelfSuspended` (borrower) both block draws and
+///   allow repayments; they are distinct for auditability and authorization —
+///   see the module docs for `lifecycle::suspend_credit_line` vs
+///   `lifecycle::self_suspend_credit_line`.
+/// - `Defaulted` blocks draws and allows repayments for cure.
 /// - `Closed` is terminal — no draws, no repayments.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +86,11 @@ pub enum CreditStatus {
     /// Credit limit was decreased below utilized amount; excess must be repaid.
     /// Draws are not flat-blocked but will fail the numeric limit check until cured.
     Restricted = 4,
+    /// Credit line is voluntarily frozen by the borrower. Draws blocked,
+    /// repayments allowed. Distinct from `Suspended` (admin-initiated) for
+    /// least-privilege: the borrower can self-unsuspend, while an admin
+    /// suspension requires admin unsuspend.
+    SelfSuspended = 5,
 }
 
 /// Errors that can be returned by the Credit contract.
@@ -157,7 +166,15 @@ pub enum CreditStatus {
 /// | 60   | `StaleStateTransition`         | Lifecycle     | Transition rejected: the credit line is already in the requested target state |
 /// | 61   | `IncompatibleVersion`          | Handshake     | Auction contract protocol version is incompatible with credit contract |
 /// | 62   | `AuctionCallFailed`            | Handshake     | Cross-contract auction CPI call failed or returned an unexpected value |
-#[soroban_sdk::contracterror]
+/// | 63   | `AuctionActive`                | Lifecycle     | Fee configuration change rejected while a liquidation auction is active |
+/// | 64   | `MissingVrfCommitment`          | Misc          | No VRF commitment exists for the borrower |
+/// | 65   | `InsufficientTreasuryBalance`  | Liquidity     | Treasury balance fell below the proposed withdrawal amount |
+// `export = false`: `ContractError` has grown past the 50-case limit the
+// Soroban contract-spec XDR format (`SCSpecUdtUnionV0.cases<50>`) allows for an
+// exported type spec. Errors still surface to clients with their pinned numeric
+// discriminants (see `tests/error_discriminants.rs`); only the spec entry is
+// skipped. Mirrors the same decision already applied to `DataKey`.
+#[soroban_sdk::contracterror(export = false)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ContractError {
@@ -242,6 +259,20 @@ pub enum ContractError {
     /// The settlement is safe to retry with a corrected `recovered_amount` or
     /// after the auction contract issue is resolved.
     AuctionCallFailed = 62,
+    /// A fee-configuration change was rejected because at least one liquidation
+    /// auction is currently active (Issue #1169).
+    ///
+    /// Fee parameters — protocol fee, treasury/bounty fee-share split, penalty
+    /// surcharge, and flat / structured late fees — are frozen while any
+    /// defaulted credit line has an in-flight liquidation auction, so that the
+    /// economics of an ongoing auction and its eventual settlement are
+    /// deterministic. The block lifts when the last active auction exits the
+    /// `Defaulted` pipeline (full settlement, reinstate, force-close, or reopen).
+    AuctionActive = 63,
+    /// No VRF commitment exists for the borrower whose score is being verified.
+    MissingVrfCommitment = 64,
+    /// The treasury balance fell below the pending withdrawal snapshot.
+    InsufficientTreasuryBalance = 65,
 }
 
 /// Stable category grouping for [`ContractError`] variants.
@@ -297,7 +328,8 @@ impl ContractError {
             | Self::CreditLineDefaulted
             | Self::AlreadySettled
             | Self::LiquidationGraceActive
-            | Self::StaleStateTransition => Lifecycle,
+            | Self::StaleStateTransition
+            | Self::AuctionActive => Lifecycle,
 
             Self::InvalidAmount
             | Self::NegativeLimit
@@ -320,6 +352,7 @@ impl ContractError {
             | Self::InsufficientRepaymentAllowance
             | Self::InsufficientRepaymentBalance
             | Self::TreasuryNotSet
+            | Self::InsufficientTreasuryBalance
             | Self::ExposureCapExceeded
             | Self::BountyNotSet => Liquidity,
 
@@ -354,7 +387,8 @@ impl ContractError {
             | Self::TreasuryProposalExists
             | Self::OriginalDrawNotFound
             | Self::AttestationBatchNotFound
-            | Self::InvalidAttestation => Misc,
+            | Self::InvalidAttestation
+            | Self::MissingVrfCommitment => Misc,
 
             // Cross-contract handshake errors — guard is always cleared before
             // these are emitted so the settlement path is safe to retry.
@@ -746,16 +780,53 @@ pub struct ProofOfReserve {
     pub bounty_balance: i128,
 }
 
+/// Paginated view of credit lines for off-chain reporting.
+///
+/// Returned by `get_credit_lines_paginated` to enable efficient navigation
+/// through large sets of credit lines using cursor-based pagination.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreditLinesPage {
+    /// Vector of credit line data for this page.
+    pub lines: soroban_sdk::Vec<CreditLineData>,
+    /// Cursor for the next page, or `None` if this is the last page.
+    pub next_cursor: Option<u32>,
+    /// Whether more results are available beyond this page.
+    pub has_more: bool,
+}
+
+/// Oracle quorum configuration for multi-oracle price feeds.
+///
+/// Used by `set_oracle_quorum_config` to configure the quorum threshold,
+/// deviation bound, and staleness window for the quorum-of-K price
+/// resolution algorithm.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleQuorumConfig {
+    /// Minimum number of oracle prices that must agree within `max_deviation_bps`.
+    pub min_quorum_k: u32,
+    /// Maximum allowed deviation between the lowest and highest price in a
+    /// qualifying window, in basis points.
+    pub max_deviation_bps: u32,
+    /// Maximum age of a quorum price in seconds before it is considered stale.
+    pub max_age_seconds: u64,
+}
+
 /// Full state snapshot for a borrower's credit line.
 ///
 /// Returned by `get_borrow_state` to provide a comprehensive view of the
 /// borrower's current state in a single read-only call. This includes
 /// credit line data, collateral balance, and borrow capabilities.
+///
+/// # Field encoding
+/// `credit_line` is a `Vec` with 0 or 1 element rather than `Option<T>`
+/// because the Soroban SDK's `#[contracttype]` XDR codegen does not support
+/// `Option<CustomStruct>` for `#[contracttype]`-derived UDTs.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BorrowStateSnapshot {
-    /// The full credit line data if it exists, or `None`.
-    pub credit_line: Option<CreditLineData>,
+    /// The full credit line data if it exists, or an empty vec.
+    pub credit_line: soroban_sdk::Vec<CreditLineData>,
     /// The borrower's collateral balance.
     pub collateral_balance: i128,
     /// The borrower's current borrow capabilities.
@@ -806,4 +877,39 @@ pub struct PauseReason {
     pub timestamp: u64,
     /// Admin address that invoked the pause.
     pub actor: soroban_sdk::Address,
+}
+
+/// Full collateral state snapshot for a borrower, returned by `get_collateral_state`.
+///
+/// All fields are read-only; no authentication is required to call the view.
+///
+/// # `health_factor_bps` vs [`CreditLineSnapshot::health_factor_bps`]
+///
+/// This field reports the **raw** collateral-to-debt ratio
+/// (`balance * 10_000 / utilized_amount`), i.e. the amount of collateral
+/// backing each unit of debt. The protocol-wide floor `min_ratio_bps` is
+/// reported next to it rather than folded into it, because `0` there means
+/// "no floor configured" and folding a disabled floor into the factor would
+/// misreport a perfectly healthy zero-collateral line as liquidatable.
+///
+/// The **min-ratio-aware** factor used by keepers — the one that reads
+/// `10_000` exactly at the liquidation threshold — is exposed by
+/// `get_health_factor` and mirrored in
+/// [`CreditLineSnapshot::health_factor_bps`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralState {
+    /// Borrower whose collateral is described.
+    pub borrower: soroban_sdk::Address,
+    /// Current collateral balance held by the contract for this borrower.
+    pub balance: i128,
+    /// Protocol-wide minimum collateral ratio in basis points (default 15 000 = 150 %).
+    /// Zero means the ratio check is disabled.
+    pub min_ratio_bps: u32,
+    /// Configured collateral token address, or `None` when not yet set.
+    pub collateral_token: Option<soroban_sdk::Address>,
+    /// Health factor expressed in basis points: `balance * 10_000 / utilized_amount`.
+    /// A value at or above `min_ratio_bps` indicates adequate collateralization.
+    /// `u32::MAX` when `utilized_amount == 0` (no outstanding debt).
+    pub health_factor_bps: u32,
 }

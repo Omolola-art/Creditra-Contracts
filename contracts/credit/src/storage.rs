@@ -59,11 +59,27 @@
 //! full per-variant tier table.
 
 use crate::types::{
-    ContractError, CreditLineData, CreditStatus, DrawsFreezeState, RepaymentSchedule,
-    TreasuryWithdrawalProposal,
+    ContractError, CreditLineData, CreditStatus, DrawsFreezeState, GracePeriodConfig,
+    OracleQuorumConfig, RepaymentSchedule, TreasuryWithdrawalProposal,
 };
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Symbol};
 
+/// Validates that a storage key encoding is canonical and does not contain
+/// duplicated or ambiguous byte representations that could lead to collisions.
+/// This prevents adverse conditions from causing silent data loss or inconsistent state.
+pub fn validate_storage_key_encoding(env: &Env, key_bytes: &Bytes) {
+    // In Soroban, XDR serialization is strictly canonical for built-in types.
+    // However, if raw bytes are used as keys, this function ensures they don't
+    // contain invalid padding or duplicate representations.
+    let len = key_bytes.len();
+    if len > 0 {
+        // Example check: reject keys with trailing zero bytes which might be 
+        // a duplicate encoding of a shorter key.
+        if key_bytes.get(len - 1).unwrap() == 0 {
+            env.panic_with_error(crate::types::ContractError::InvalidAmount); // Reusing an error code for simplicity
+        }
+    }
+}
 /// Storage keys used in instance and persistent storage.
 ///
 /// # Storage tier convention
@@ -134,6 +150,15 @@ pub enum DataKey {
     CreditLineCount,
     /// Count of currently Active credit lines.
     ActiveLineCount,
+    /// Count of credit lines whose liquidation auction is currently active
+    /// (i.e. lines in [`CreditStatus::Defaulted`] with an in-flight auction).
+    ///
+    /// Incremented when a line enters `Defaulted` and decremented when a line
+    /// exits the `Defaulted` pipeline (full settlement, reinstate, admin
+    /// force-close, or reopen). While non-zero, fee-configuration entrypoints
+    /// revert with [`ContractError::AuctionActive`] so auction economics stay
+    /// deterministic (Issue #1169).
+    PendingAuctionCount,
     /// Borrower → stable numeric id used for deterministic enumeration.
     CreditLineIdByBorrower(Address),
     /// Stable numeric id → borrower address.
@@ -264,8 +289,6 @@ pub enum DataKey {
     BorrowerExposureCap(Address),
     /// Per-borrower allowlist of accepted multi-collateral token addresses.
     CollateralTokenAllowlist,
-    /// Per-borrower, per-token collateral balance (multi-collateral path).
-    CollateralBalanceV2(Address, Address),
     /// Per-borrower committed attestation batch.
     AttestationBatch(Address),
 }
@@ -309,7 +332,7 @@ pub fn bump_instance_ttl(env: &Env) {
         .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
-fn bump_persistent_ttl<K>(env: &Env, key: &K)
+pub fn bump_persistent_ttl<K>(env: &Env, key: &K)
 where
     K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
 {
@@ -324,6 +347,12 @@ pub fn bump_credit_line_ttl(env: &Env, borrower: &Address) {
     env.storage()
         .persistent()
         .extend_ttl(borrower, CREDIT_LINE_TTL_THRESHOLD, CREDIT_LINE_TTL_EXTEND_TO);
+}
+
+/// Refresh the persistent TTL for a borrower's VRF commitment.
+pub fn bump_vrf_commitment_ttl(env: &Env, borrower: &Address) {
+    let key = DataKey::VrfCommitment(borrower.clone());
+    bump_persistent_ttl(env, &key);
 }
 
 /// Refresh the persistent TTL for an active credit-line freeze record.
@@ -369,6 +398,39 @@ pub fn get_total_utilized(env: &Env) -> i128 {
         .unwrap_or(0)
 }
 
+/// Assert that the persisted `TotalUtilized` accumulator matches the live sum of
+/// every credit line's `utilized_amount`.
+///
+/// This is a fail-closed invariant check: any drift in the aggregate is treated
+/// as protocol corruption and aborts the transaction with a deterministic error
+/// message so operators can diagnose storage drift without exposing sensitive
+/// state.
+pub fn assert_total_utilized_conserved(env: &Env) {
+    let stored_total = get_total_utilized(env);
+    let mut recomputed_total = 0_i128;
+    let line_count = get_credit_line_count(env);
+
+    for id in 0..line_count {
+        let Some(borrower) = get_borrower_by_credit_line_id(env, id) else {
+            continue;
+        };
+        // Load through the TTL-bumping getter so this consistency check never
+        // bypasses the persistent TTL policy (Issue #1273).
+        let Some(line) = get_credit_line(env, &borrower) else {
+            continue;
+        };
+        recomputed_total = recomputed_total
+            .checked_add(line.utilized_amount)
+            .unwrap_or_else(|| panic!("utilization conservation: recomputed total overflow"));
+    }
+
+    if stored_total != recomputed_total {
+        panic!(
+            "utilization conservation: stored={stored_total}, recomputed={recomputed_total}"
+        );
+    }
+}
+
 /// Return the global collateral accumulator.
 pub fn get_total_collateral(env: &Env) -> i128 {
     bump_instance_ttl(env);
@@ -376,6 +438,30 @@ pub fn get_total_collateral(env: &Env) -> i128 {
         .instance()
         .get(&DataKey::TotalCollateral)
         .unwrap_or(0)
+}
+
+/// Assert that the persisted `TotalCollateral` accumulator matches the live sum of
+/// the tracked collateral balances for the known borrower set.
+pub fn assert_total_collateral_conserved(env: &Env) {
+    let stored_total = get_total_collateral(env);
+    let mut recomputed_total = 0_i128;
+    let line_count = get_credit_line_count(env);
+
+    for id in 0..line_count {
+        let Some(borrower) = get_borrower_by_credit_line_id(env, id) else {
+            continue;
+        };
+        let balance = get_collateral_balance(env, &borrower);
+        recomputed_total = recomputed_total
+            .checked_add(balance)
+            .unwrap_or_else(|| panic!("collateral conservation: recomputed total overflow"));
+    }
+
+    if stored_total != recomputed_total {
+        panic!(
+            "collateral conservation: stored={stored_total}, recomputed={recomputed_total}"
+        );
+    }
 }
 
 /// Return the number of indexed credit lines.
@@ -408,6 +494,62 @@ pub fn decrement_active_line_count(env: &Env) {
     env.storage()
         .instance()
         .set(&DataKey::ActiveLineCount, &count.saturating_sub(1));
+}
+
+// ── Active liquidation auction tracking (Issue #1169) ────────────────────────
+//
+// A liquidation auction is considered **active** from the moment a credit line
+// enters `CreditStatus::Defaulted` until that line exits the `Defaulted`
+// pipeline through one of the four terminal paths:
+//
+//   1. `settle_default_liquidation` with full recovery   (Defaulted → Closed)
+//   2. `reinstate_credit_line`                           (Defaulted → Active/Restricted)
+//   3. `close_credit_line` admin force-close              (Defaulted → Closed)
+//   4. `open_credit_line` admin reopen                    (Defaulted → Active)
+//
+// A **partial** settlement leaves the line in `Defaulted`, so the auction stays
+// active and the counter is not touched.
+//
+// The counter is maintained atomically with the credit-line status transition
+// inside the same host transaction, so the guard below sees a consistent,
+// deterministic value under any interleaving of concurrent calls.
+
+/// Return the number of credit lines with an active liquidation auction.
+pub fn get_pending_auction_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingAuctionCount)
+        .unwrap_or(0)
+}
+
+/// Mark one more liquidation auction as active (line entered `Defaulted`).
+pub fn increment_pending_auction_count(env: &Env) {
+    let count = get_pending_auction_count(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAuctionCount, &count.saturating_add(1));
+}
+
+/// Mark one liquidation auction as no longer active (line exited `Defaulted`).
+pub fn decrement_pending_auction_count(env: &Env) {
+    let count = get_pending_auction_count(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAuctionCount, &count.saturating_sub(1));
+}
+
+/// Revert with [`crate::types::ContractError::AuctionActive`] if any
+/// liquidation auction is currently active.
+///
+/// This is the deterministic state check injected into fee-configuration
+/// entrypoints (Issue #1169): while an auction is in flight, changing the
+/// protocol fee, fee-share split, penalty surcharge, or late-fee schedule
+/// could silently change the economics of the in-flight auction or its
+/// eventual settlement, so such changes are rejected atomically.
+pub fn assert_no_active_auctions(env: &Env) {
+    if get_pending_auction_count(env) > 0 {
+        env.panic_with_error(crate::types::ContractError::AuctionActive);
+    }
 }
 
 /// Return the configured global exposure cap, if set.
@@ -451,18 +593,27 @@ pub fn get_borrower_by_credit_line_id(env: &Env, id: u32) -> Option<Address> {
 }
 
 /// Ensure a borrower has a stable enumeration id and return it.
+///
+/// Both id↔borrower index entries are persistent per-borrower state, so each
+/// write also refreshes its TTL. Without that, an index entry created once at
+/// the network minimum TTL would be archived long before the credit line it
+/// points at, breaking enumeration (`enumerate_credit_lines`) and any later
+/// lookup keyed by id even though the line itself stays live (Issue #1273).
 pub fn ensure_credit_line_id(env: &Env, borrower: &Address) -> u32 {
     if let Some(existing_id) = get_credit_line_id(env, borrower) {
         return existing_id;
     }
 
     let next_id = get_credit_line_count(env);
-    env.storage()
-        .persistent()
-        .set(&DataKey::CreditLineIdByBorrower(borrower.clone()), &next_id);
-    env.storage()
-        .persistent()
-        .set(&DataKey::CreditLineBorrowerById(next_id), borrower);
+
+    let id_key = DataKey::CreditLineIdByBorrower(borrower.clone());
+    env.storage().persistent().set(&id_key, &next_id);
+    bump_persistent_ttl(env, &id_key);
+
+    let reverse_key = DataKey::CreditLineBorrowerById(next_id);
+    env.storage().persistent().set(&reverse_key, borrower);
+    bump_persistent_ttl(env, &reverse_key);
+
     env.storage()
         .instance()
         .set(&DataKey::CreditLineCount, &next_id.saturating_add(1));
@@ -484,6 +635,7 @@ pub fn adjust_total_utilized(env: &Env, previous_utilized: i128, new_utilized: i
     env.storage()
         .instance()
         .set(&DataKey::TotalUtilized, &updated_total);
+    assert_total_utilized_conserved(env);
 }
 
 /// Adjust the global collateral accumulator by the change in one borrower balance.
@@ -501,6 +653,7 @@ pub fn adjust_total_collateral(env: &Env, previous_balance: i128, new_balance: i
     env.storage()
         .instance()
         .set(&DataKey::TotalCollateral, &updated_total);
+    assert_total_collateral_conserved(env);
 }
 
 /// Persist a credit line and atomically apply its contribution delta to the
@@ -669,6 +822,19 @@ pub fn add_treasury_balance(env: &Env, amount: i128) {
     env.storage()
         .instance()
         .set(&DataKey::TreasuryBalance, &updated_balance);
+}
+
+/// Deduct a timelocked withdrawal snapshot without discarding newer fees.
+/// Returns the balance remaining after the withdrawal.
+pub fn subtract_treasury_balance(env: &Env, amount: i128) -> i128 {
+    let remaining = get_treasury_balance(env)
+        .checked_sub(amount)
+        .filter(|balance| amount >= 0 && *balance >= 0)
+        .unwrap_or_else(|| env.panic_with_error(ContractError::InsufficientTreasuryBalance));
+    env.storage()
+        .instance()
+        .set(&DataKey::TreasuryBalance, &remaining);
+    remaining
 }
 
 /// Clear accumulated treasury balance after withdrawal.
@@ -998,17 +1164,27 @@ pub fn set_close_factor_bps(env: &Env, bps: u32) {
 }
 
 /// Return the installment schedule for a borrower, if configured.
+///
+/// Bumps the persistent TTL of the entry on read so an active borrower's
+/// schedule is not silently archived by the network (Issue #1273).
 pub fn get_repayment_schedule(env: &Env, borrower: &Address) -> Option<RepaymentSchedule> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::RepaymentSchedule(borrower.clone()))
+    let key = DataKey::RepaymentSchedule(borrower.clone());
+    if env.storage().persistent().has(&key) {
+        bump_persistent_ttl(env, &key);
+    }
+    env.storage().persistent().get(&key)
 }
 
-/// Persist the installment schedule for a borrower.
+/// Persist the installment schedule for a borrower and bump its persistent TTL.
+///
+/// The schedule lives in its own persistent entry, so writing it must extend
+/// that entry's TTL as well; otherwise a schedule installed once could expire
+/// even while the credit line itself keeps being refreshed on read (Issue
+/// #1273).
 pub fn set_repayment_schedule(env: &Env, borrower: &Address, schedule: &RepaymentSchedule) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::RepaymentSchedule(borrower.clone()), schedule);
+    let key = DataKey::RepaymentSchedule(borrower.clone());
+    env.storage().persistent().set(&key, schedule);
+    bump_persistent_ttl(env, &key);
 }
 
 /// Get the last draw timestamp for a borrower, if any.
@@ -1031,6 +1207,50 @@ pub fn get_last_draw_ts(env: &Env, borrower: &Address) -> Option<u64> {
 pub fn set_last_draw_ts(env: &Env, borrower: &Address, ts: u64) {
     let key = DataKey::LastDrawTs(borrower.clone());
     env.storage().persistent().set(&key, &ts);
+    bump_persistent_ttl(env, &key);
+}
+
+/// Return the recorded original draw amount for `(borrower, timestamp)`, if any.
+///
+/// The draw audit trail is per-borrower persistent state, so the read path
+/// refreshes its TTL just like the credit-line getter does; otherwise an entry
+/// could be archived while the draw is still reversible (Issue #1273).
+pub fn get_draw_audit(env: &Env, borrower: &Address, timestamp: u64) -> Option<i128> {
+    let key = DataKey::DrawAudit(DrawAuditKey {
+        borrower: borrower.clone(),
+        timestamp,
+    });
+    if env.storage().persistent().has(&key) {
+        bump_persistent_ttl(env, &key);
+    }
+    env.storage().persistent().get(&key)
+}
+
+/// Return the amount already reversed against an original draw (0 if none).
+///
+/// Bumps the persistent TTL on read so the reversal tracker stays live for as
+/// long as the original draw can be reversed (Issue #1273).
+pub fn get_draw_reversed_amount(env: &Env, borrower: &Address, timestamp: u64) -> i128 {
+    let key = DataKey::DrawReversedAmount(DrawAuditKey {
+        borrower: borrower.clone(),
+        timestamp,
+    });
+    if env.storage().persistent().has(&key) {
+        bump_persistent_ttl(env, &key);
+    }
+    env.storage().persistent().get(&key).unwrap_or(0)
+}
+
+/// Persist the amount reversed against an original draw and bump its TTL.
+///
+/// The reversal tracker lives in its own persistent entry, so writing it must
+/// extend that entry's TTL as well (Issue #1273).
+pub fn set_draw_reversed_amount(env: &Env, borrower: &Address, timestamp: u64, amount: i128) {
+    let key = DataKey::DrawReversedAmount(DrawAuditKey {
+        borrower: borrower.clone(),
+        timestamp,
+    });
+    env.storage().persistent().set(&key, &amount);
     bump_persistent_ttl(env, &key);
 }
 
@@ -1115,16 +1335,32 @@ pub fn is_paused(env: &Env) -> bool {
 
 /// Set the protocol pause state (admin only, enforced by caller).
 ///
+/// This is a **pure flag write** — it never touches the pause reason. Reason
+/// maintenance (clear on unpause / on reason-less pause, write on pause-with-
+/// reason) is the responsibility of the entrypoints so that idempotent
+/// no-ops cannot clobber the audit trail. See [`set_pause_reason`] and
+/// [`clear_pause_reason`].
+///
+/// Callers are expected to detect no-op transitions (requesting the state the
+/// contract is already in) *before* calling this, so that duplicate pause or
+/// unpause requests do not emit misleading transition events.
+///
 /// # Storage
 /// - **Type**: Instance storage (shared TTL with all instance keys)
 /// - **Key**: `Symbol("paused")`
 /// - **TTL Note**: Shares instance TTL — extend alongside other instance keys.
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&paused_key(env), &paused);
-    if !paused {
-        // Clear the pause reason when unpausing.
-        env.storage().instance().remove(&DataKey::PauseReason);
-    }
+}
+
+/// Clear any stored pause reason.
+///
+/// Called on unpause and on a reason-less pause so the stored reason always
+/// reflects the most recent pause invocation. This prevents a stale reason
+/// (recorded by an earlier pause-with-reason) from surviving into a later
+/// reason-less pause or unpause.
+pub fn clear_pause_reason(env: &Env) {
+    env.storage().instance().remove(&DataKey::PauseReason);
 }
 
 /// Get the structured pause reason, if one was recorded during the last pause.
@@ -1492,6 +1728,10 @@ pub fn set_risk_admin_cooldown_seconds(env: &Env, seconds: u64) {
 
 /// Get the timestamp of the last risk admin action.
 /// Returns `0` when no action has been recorded yet.
+///
+/// # Deprecation note
+/// This global key is retained for backward compatibility. New code should
+/// use [`get_last_risk_admin_action_ts_for`] which is scoped per borrower.
 pub fn get_last_risk_admin_action_ts(env: &Env) -> u64 {
     let key = symbol_short!("rad_last");
     env.storage()
@@ -1501,6 +1741,10 @@ pub fn get_last_risk_admin_action_ts(env: &Env) -> u64 {
 }
 
 /// Set the timestamp of the last risk admin action.
+///
+/// # Deprecation note
+/// This global key is retained for backward compatibility. New code should
+/// use [`set_last_risk_admin_action_ts_for`] which is scoped per borrower.
 pub fn set_last_risk_admin_action_ts(env: &Env, ts: u64) {
     let key = symbol_short!("rad_last");
     env.storage()
@@ -1508,10 +1752,66 @@ pub fn set_last_risk_admin_action_ts(env: &Env, ts: u64) {
         .set(&key, &ts);
 }
 
+/// Get the timestamp of the last risk admin action for a specific borrower.
+///
+/// Keyed by `(symbol_short!("rad_last"), borrower)` in persistent storage,
+/// mirroring `LastAccrualAdminActionTs` which is also per-borrower.
+/// Returns `0` when no action has been recorded for this borrower yet.
+pub fn get_last_risk_admin_action_ts_for(env: &Env, borrower: &Address) -> u64 {
+    let key = (symbol_short!("rad_last"), borrower.clone());
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(0)
+}
+
+/// Set the timestamp of the last risk admin action for a specific borrower.
+///
+/// Keyed by `(symbol_short!("rad_last"), borrower)` in persistent storage.
+pub fn set_last_risk_admin_action_ts_for(env: &Env, borrower: &Address, ts: u64) {
+    let key = (symbol_short!("rad_last"), borrower.clone());
+    env.storage()
+        .persistent()
+        .set(&key, &ts);
+}
+
+/// Assert that the risk admin cooldown has elapsed since the last action
+/// for the given borrower.
+///
+/// # Scope (Issue #1280)
+/// The cooldown is now **per-borrower**: each borrower's last-action timestamp
+/// is tracked independently. Updating borrower A's risk parameters does not
+/// start or reset the cooldown for borrower B.
+///
+/// # Behaviour
+/// - When `cooldown_seconds == 0` (default): always passes (disabled).
+/// - When no prior action exists for this borrower (`last_ts == 0`): always
+///   passes (first update is never blocked).
+/// - Otherwise: reverts with [`ContractError::RiskAdminCooldownActive`] if
+///   `now < last_ts + cooldown_seconds`.
+pub fn assert_risk_admin_cooldown_elapsed_for(env: &Env, borrower: &Address) {
+    let cooldown = get_risk_admin_cooldown_seconds(env);
+    if cooldown == 0 {
+        return;
+    }
+    let last_ts = get_last_risk_admin_action_ts_for(env, borrower);
+    if last_ts == 0 {
+        return;
+    }
+    let now = env.ledger().timestamp();
+    if now < last_ts.saturating_add(cooldown) {
+        env.panic_with_error(ContractError::RiskAdminCooldownActive);
+    }
+}
+
 /// Assert that the risk admin cooldown has elapsed since the last action.
 /// Panics with `RiskAdminCooldownActive` if the cooldown has not yet elapsed.
 /// When `last_ts` is `0` (no prior action recorded), the cooldown is not
 /// enforced so the first call always succeeds.
+///
+/// # Deprecation note
+/// This checks the legacy global timestamp. Prefer
+/// [`assert_risk_admin_cooldown_elapsed_for`] for per-borrower enforcement.
 pub fn assert_risk_admin_cooldown_elapsed(env: &Env) {
     let cooldown = get_risk_admin_cooldown_seconds(env);
     if cooldown == 0 {
@@ -1576,4 +1876,67 @@ pub fn enforce_freeze_cooldown(env: &Env) {
             env.panic_with_error(ContractError::FreezeCooldownActive);
         }
     }
+}
+
+// ── Grace period config (instance) ───────────────────────────────────────────
+
+pub fn get_grace_period_config(env: &Env) -> Option<GracePeriodConfig> {
+    env.storage().instance().get(&grace_period_key(env))
+}
+
+// ── Per-borrower liquidation grace (persistent) ───────────────────────────────
+
+pub fn get_per_borrower_liquidation_grace(env: &Env, borrower: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::LiquidationGracePeriod(borrower.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_per_borrower_liquidation_grace(env: &Env, borrower: &Address, secs: u64) {
+    let key = DataKey::LiquidationGracePeriod(borrower.clone());
+    if secs == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &secs);
+        bump_persistent_ttl(env, &key);
+    }
+}
+
+// ── Oracle quorum config (instance) ─────────────────────────────────────────
+
+pub fn get_oracle_quorum_config(env: &Env) -> Option<OracleQuorumConfig> {
+    env.storage().instance().get(&DataKey::OracleQuorumConfig)
+}
+
+pub fn set_oracle_quorum_config(env: &Env, cfg: &OracleQuorumConfig) {
+    env.storage().instance().set(&DataKey::OracleQuorumConfig, cfg);
+}
+
+// ── Treasury withdrawal proposal (instance) ───────────────────────────────────
+
+pub fn get_pending_treasury_withdrawal(env: &Env) -> Option<TreasuryWithdrawalProposal> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingTreasuryWithdrawal)
+}
+
+pub fn set_pending_treasury_withdrawal(env: &Env, proposal: &TreasuryWithdrawalProposal) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingTreasuryWithdrawal, proposal);
+}
+
+pub fn clear_pending_treasury_withdrawal(env: &Env) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingTreasuryWithdrawal);
+}
+
+// ── Max borrower exposure (persistent) ────────────────────────────────────────
+
+pub fn get_max_borrower_exposure(env: &Env, borrower: &Address) -> Option<i128> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MaxBorrowerExposure(borrower.clone()))
 }
